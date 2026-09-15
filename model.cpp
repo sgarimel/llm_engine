@@ -23,18 +23,51 @@ const unordered_map<string, function<torch::Tensor(const torch::Tensor&)> > acti
     {"tanh", [](const torch::Tensor& x) { return torch::tanh(x); }}
 };
 
-torch::Tensor Model::forward(const torch::Tensor& x) {
-    throw std::logic_error("Model::forward not implemented");
+torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor& padding_mask) {
+
+
+    torch::Tensor x = torch::nn::functional::embedding(
+                        input_ids, 
+                        this->embeddings
+                      );
+
+    auto mask_options = torch::TensorOptions().dtype(torch::kBool).device(input_ids.device());
+    int seq_len = input_ids.size(1);
+    int batch_size = input_ids.size(0);
+    torch::Tensor causal_mask = torch::triu(
+        torch::ones(
+            {seq_len, seq_len}, 
+            bool_options
+        ), 
+        1
+    ).view({1, 1, seq_len, seq_len});
+
+    // has dimension (B, N)
+    torch::Tensor inverted_padding_mask = padding_mask.eq(0); // go from 0 = blocked, 1 = allowed to 0 = allowed, 1 = blocked
+    inverted_padding_mask = inverted_padding_mask.view({
+        input_ids.size(0),
+        1,
+        1,
+        seq_len
+    });
+
+    torch::Tensor combined_mask = torch::logical_or(causal_mask, inverted_padding_mask);
+
+    
+                      
+    
+    
+    
+
 }
 
 torch::Tensor Block::forward(const torch::Tensor& x, const torch::Tensor& attention_mask) {
     torch::Tensor pre_normed = this->pre_attention_norm.forward(x);
-    // Create the masks
-    
-    torch::Tensor attention_output = this->attention.forward(x);
-    torch::Tensor mlp_output = this->mlp.forward(x);
-    torch::Tensor post_normed = this->post_attention_norm.forward(x);
-    return post_normed;
+    torch::Tensor attention_output = this->attention.forward(pre_normed, attention_mask);
+    torch::Tensor with_res_connection = attention_output + x; 
+    torch::Tensor post_normed = this->post_attention_norm.forward(with_res_connection);
+    torch::Tensor mlp_output = this->mlp.forward(post_normed);
+    return with_res_connection + mlp_output;
 }
 
 torch::Tensor Attention::rope_embeddings(const torch::Tensor& x) { 

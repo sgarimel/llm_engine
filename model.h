@@ -125,7 +125,7 @@ class Block {
               pre_attention_norm(input_norm),
               post_attention_norm(post_norm) {}
 
-        torch::Tensor forward(const torch::Tensor& x);
+        torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& attention_mask);
 
     private:
         Attention attention;
