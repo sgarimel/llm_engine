@@ -1,7 +1,13 @@
 #include <torch/torch.h>
 #include <iostream> 
+#include <functional>
+#include <unordered_map>
 
 using namespace std; 
+
+
+extern const unordered_map<string, ActivationFunction>
+    activation_to_function;
 
 struct ModelConfig { 
     int vocab_size; 
@@ -13,8 +19,20 @@ struct ModelConfig {
     int head_dim; 
     int max_seq_len; 
 
+    string hidden_act;
     double rms_norm_eps; 
     double rope_theta;
+};
+
+struct GenerationConfig {
+    int bos_token_id;
+    int pad_token_id;
+    vector<int> eos_token_ids;
+    bool do_sample;
+    double repetition_penalty;
+    double temperature;
+    double top_p;
+    int top_k;
 };
 
 class LayerNorm {
@@ -38,17 +56,29 @@ class Attention {
             torch::Tensor bk,
             torch::Tensor wv,
             torch::Tensor bv,
-            torch::Tensor wo)
+            torch::Tensor wo, 
+            int num_query_heads, 
+            int num_kv_heads, 
+            int head_dim, 
+            double rope_theta)
             : wq(wq),
             bq(bq),
             wk(wk),
             bk(bk),
             wv(wv),
             bv(bv),
-            wo(wo) {}
+            wo(wo),
+            num_query_heads(num_query_heads),
+            num_kv_heads(num_kv_heads),
+            head_dim(head_dim),
+            rope_theta(rope_theta) {}
  
-        torch::Tensor forward(const torch::Tensor& x);
+        torch::Tensor forward(
+            const torch::Tensor& x,
+            const torch::Tensor& attention_mask);
     private: 
+        torch::Tensor rope_embeddings(const torch::Tensor& x);
+
         torch::Tensor wq; 
         torch::Tensor bq; 
         torch::Tensor wk; 
@@ -56,6 +86,11 @@ class Attention {
         torch::Tensor wv;
         torch::Tensor bv; 
         torch::Tensor wo; 
+
+        int num_query_heads;
+        int num_kv_heads;
+        int head_dim;
+        double rope_theta;
 };
 
 class MLP {
@@ -63,16 +98,19 @@ class MLP {
         MLP(
             torch::Tensor gate,
             torch::Tensor up,
-            torch::Tensor down)
+            torch::Tensor down,
+            string hidden_act)
             : gate_proj(gate),
             up_proj(up),
-            down_proj(down) {}
+            down_proj(down),
+            hidden_act(hidden_act) {}
 
         torch::Tensor forward(const torch::Tensor& x);
     private: 
         torch::Tensor gate_proj; 
         torch::Tensor up_proj;
         torch::Tensor down_proj; 
+        string hidden_act;
 };
 
 class Block {
@@ -100,10 +138,12 @@ class Model {
     public:
         Model(
             ModelConfig config,
+            GenerationConfig generation_config,
             torch::Tensor embeddings,
             std::vector<Block> blocks,
             LayerNorm norm)
             : config(config),
+              generation_config(generation_config),
               embeddings(embeddings),
               blocks(blocks),
               norm(norm) {}
@@ -112,6 +152,7 @@ class Model {
 
     private:
         ModelConfig config;
+        GenerationConfig generation_config;
         torch::Tensor embeddings;
         std::vector<Block> blocks;
         LayerNorm norm;
@@ -119,14 +160,20 @@ class Model {
 
 class Loader {
     public:
-        Loader(string config_path, string weights_path)
+        Loader(
+            string config_path,
+            string generation_config_path,
+            string weights_path)
             : config_path(config_path),
+              generation_config_path(generation_config_path),
               weights_path(weights_path) {}
 
         ModelConfig load_config();
+        GenerationConfig load_generation_config();
         Model load_model();
 
     private:
         string config_path;
+        string generation_config_path;
         string weights_path;
 };

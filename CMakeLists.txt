@@ -16,6 +16,15 @@ target_link_libraries(
     nlohmann_json::nlohmann_json
 )
 
+add_executable(llmengine_app main.cpp)
+
+target_link_libraries(
+    llmengine_app
+    PRIVATE
+    llmengine
+    "${TORCH_LIBRARIES}"
+)
+
 set_property(
     TARGET llmengine
     PROPERTY CXX_STANDARD 20
