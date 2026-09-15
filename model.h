@@ -5,6 +5,8 @@
 
 using namespace std; 
 
+using ActivationFunction =
+    function<torch::Tensor(const torch::Tensor&)>;
 
 extern const unordered_map<string, ActivationFunction>
     activation_to_function;
@@ -148,7 +150,9 @@ class Model {
               blocks(blocks),
               norm(norm) {}
 
-        torch::Tensor forward(const torch::Tensor& x);
+        torch::Tensor forward(
+            const torch::Tensor& input_ids,
+            const torch::Tensor& padding_mask);
 
     private:
         ModelConfig config;

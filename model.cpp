@@ -37,7 +37,7 @@ torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor
     torch::Tensor causal_mask = torch::triu(
         torch::ones(
             {seq_len, seq_len}, 
-            bool_options
+            mask_options
         ), 
         1
     ).view({1, 1, seq_len, seq_len});
@@ -53,12 +53,14 @@ torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor
 
     torch::Tensor combined_mask = torch::logical_or(causal_mask, inverted_padding_mask);
 
-    
-                      
-    
-    
-    
+    for(Block& block : this->blocks) { 
+        x = block.forward(x, combined_mask);
+    }
 
+    x = this->norm.forward(x); 
+    torch::Tensor logits = torch::matmul(x, this->embeddings.transpose(-2, -1));
+
+    return logits.select(1, -1);
 }
 
 torch::Tensor Block::forward(const torch::Tensor& x, const torch::Tensor& attention_mask) {
@@ -103,9 +105,9 @@ torch::Tensor Attention::forward(
     const torch::Tensor& attention_mask) { 
     // dimension of x is (B, N, d_model)
     // dimension of wq is (d_model, d_model), bq is (d_model)
-    torch::Tensor q = torch::nn::functional::linear(x, this->wq, this->bq);
-    torch::Tensor k = torch::nn::functional::linear(x, this->wk, this->bk);
-    torch::Tensor v = torch::nn::functional::linear(x, this->wv, this->bv);
+    torch::Tensor q = torch::matmul(x, this->wq.transpose(-2, -1)) + this->bq;
+    torch::Tensor k = torch::matmul(x, this->wk.transpose(-2, -1)) + this->bk;
+    torch::Tensor v = torch::matmul(x, this->wv.transpose(-2, -1)) + this->bv;
 
     // we now want to split q k v into heads 
     q = q.view({q.size(0), q.size(1), this->num_query_heads, this->head_dim}).transpose(1, 2);
@@ -120,10 +122,10 @@ torch::Tensor Attention::forward(
     v = v.repeat_interleave(repetitions, 1);
 
     torch::Tensor scores = torch::einsum("bhid, bhjd -> bhij", {q, k});
-    scores /= std::(static_cast<double>(this->head_dim));
+    scores /= std::sqrt(static_cast<double>(this->head_dim));
     scores.masked_fill_(
         attention_mask,
-        std::numeric_limits<float>::lowest()
+        std::numeric_limits<c10::BFloat16>::lowest()
     );
 
     // take final row-wise softmax
@@ -144,7 +146,9 @@ torch::Tensor MLP::forward(const torch::Tensor& x) {
     // gate_proj = (intermediate_size, d_model)
     // up_proj = (intermediate_size, d_model)
     // down_proj = (d_model, intermediate_size)
-    torch::Tensor swished = activation_to_function(this->hidden_act)(torch::matmul(x, this->gate_proj.transpose(-2, -1))); // (B, N, intermediate_size)
+    torch::Tensor swished = activation_to_function.at(this->hidden_act)(
+        torch::matmul(x, this->gate_proj.transpose(-2, -1))
+    ); // (B, N, intermediate_size)
     torch::Tensor up = torch::matmul(x, this->up_proj.transpose(-2, -1)); // (B, N, intermediate)
     torch::Tensor hadamard = swished * up; // (B, N, intermediate)
     return torch::matmul(hadamard, this->down_proj.transpose(-2, -1)); // (B, N, d_model)
@@ -154,10 +158,10 @@ torch::Tensor MLP::forward(const torch::Tensor& x) {
 torch::Tensor LayerNorm::forward(const torch::Tensor& x) {
     auto input_type = x.scalar_type();
     auto x_float = x.to(torch::kFloat32);
-    auto var = torch::mean(torch::pow(x_float, 2), -1); // needs to be (B, N, 1) since we norm each token and need to broadcasted along final dimension
+    auto var = torch::mean(torch::pow(x_float, 2), -1, true); // needs to be (B, N, 1) since we norm each token and need to broadcasted along final dimension
     auto normalized = x_float * torch::rsqrt(var + this->eps); 
     // this->weights has dimension (d_model)
-    torch::Tensor output = x_float * weights; // (B, N, d_model) 
+    torch::Tensor output = normalized * weights; // (B, N, d_model) 
     return output.to(input_type);
 }
 
@@ -271,7 +275,7 @@ torch::Tensor load_tensor(
         const_cast<char*>(tensor_data), 
         info.shape, 
         torch::TensorOptions().dtype(parse_dtype(info.dtype))
-    );
+    ).clone();
 }
 
 void validate_tensor_names(
