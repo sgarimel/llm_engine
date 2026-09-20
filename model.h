@@ -1,3 +1,5 @@
+#pragma once
+
 #include <torch/torch.h>
 #include <iostream> 
 #include <functional>
@@ -35,6 +37,12 @@ struct GenerationConfig {
     double temperature;
     double top_p;
     int top_k;
+};
+
+struct LayerKVCache { 
+    torch::Tensor keys; 
+    torch::Tensor values; 
+    int64_t length = 0;  // the number of truly populated sequence positions
 };
 
 class LayerNorm {
@@ -77,9 +85,13 @@ class Attention {
  
         torch::Tensor forward(
             const torch::Tensor& x,
-            const torch::Tensor& attention_mask);
+            const torch::Tensor& attention_mask,
+            bool use_cache);
+        void initialize_cache(int64_t batch_size, int64_t capacity);
     private: 
-        torch::Tensor rope_embeddings(const torch::Tensor& x);
+        torch::Tensor rope_embeddings(
+            const torch::Tensor& x,
+            int64_t start_position);
 
         torch::Tensor wq; 
         torch::Tensor bq; 
@@ -88,6 +100,7 @@ class Attention {
         torch::Tensor wv;
         torch::Tensor bv; 
         torch::Tensor wo; 
+        LayerKVCache cache;
 
         int num_query_heads;
         int num_kv_heads;
@@ -127,7 +140,11 @@ class Block {
               pre_attention_norm(input_norm),
               post_attention_norm(post_norm) {}
 
-        torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& attention_mask);
+        torch::Tensor forward(
+            const torch::Tensor& x,
+            const torch::Tensor& attention_mask,
+            bool use_cache);
+        void initialize_cache(int64_t batch_size, int64_t capacity);
 
     private:
         Attention attention;
@@ -152,7 +169,9 @@ class Model {
 
         torch::Tensor forward(
             const torch::Tensor& input_ids,
-            const torch::Tensor& padding_mask);
+            const torch::Tensor& padding_mask,
+            bool use_cache = false);
+        void initialize_cache(int64_t batch_size);
 
     private:
         ModelConfig config;
@@ -160,6 +179,7 @@ class Model {
         torch::Tensor embeddings;
         std::vector<Block> blocks;
         LayerNorm norm;
+
 };
 
 class Loader {

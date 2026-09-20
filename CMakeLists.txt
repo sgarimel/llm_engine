@@ -17,7 +17,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tokenizers_cpp_dependency)
 
-add_library(llmengine model.cpp tokenizer.cpp)
+add_library(llmengine model.cpp tokenizer.cpp inference.cpp)
 
 target_link_libraries(
     llmengine

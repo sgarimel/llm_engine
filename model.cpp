@@ -12,7 +12,6 @@
 #include <cmath>
 #include <unordered_set>
 
-
 using namespace std; 
 using namespace nlohmann; 
 
@@ -23,7 +22,7 @@ const unordered_map<string, function<torch::Tensor(const torch::Tensor&)> > acti
     {"tanh", [](const torch::Tensor& x) { return torch::tanh(x); }}
 };
 
-torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor& padding_mask) {
+torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor& padding_mask, bool use_cache) {
 
 
     torch::Tensor x = torch::nn::functional::embedding(
@@ -31,16 +30,13 @@ torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor
                         this->embeddings
                       );
 
+    int64_t query_length = input_ids.size(1);
+    int64_t key_length = padding_mask.size(1);
     auto mask_options = torch::TensorOptions().dtype(torch::kBool).device(input_ids.device());
-    int seq_len = input_ids.size(1);
-    int batch_size = input_ids.size(0);
     torch::Tensor causal_mask = torch::triu(
-        torch::ones(
-            {seq_len, seq_len}, 
-            mask_options
-        ), 
-        1
-    ).view({1, 1, seq_len, seq_len});
+        torch::ones({query_length, key_length}, mask_options),
+        key_length - query_length + 1
+    ).view({1, 1, query_length, key_length});
 
     // has dimension (B, N)
     torch::Tensor inverted_padding_mask = padding_mask.eq(0); // go from 0 = blocked, 1 = allowed to 0 = allowed, 1 = blocked
@@ -48,13 +44,13 @@ torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor
         input_ids.size(0),
         1,
         1,
-        seq_len
+        key_length
     });
 
     torch::Tensor combined_mask = torch::logical_or(causal_mask, inverted_padding_mask);
 
     for(Block& block : this->blocks) { 
-        x = block.forward(x, combined_mask);
+        x = block.forward(x, combined_mask, use_cache);
     }
 
     x = this->norm.forward(x); 
@@ -63,16 +59,34 @@ torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor
     return logits.select(1, -1);
 }
 
-torch::Tensor Block::forward(const torch::Tensor& x, const torch::Tensor& attention_mask) {
+void Model::initialize_cache(int64_t batch_size) {
+    for (Block& block : this->blocks)
+        block.initialize_cache(batch_size, this->config.max_seq_len);
+}
+
+torch::Tensor Block::forward(
+    const torch::Tensor& x,
+    const torch::Tensor& attention_mask,
+    bool use_cache) {
     torch::Tensor pre_normed = this->pre_attention_norm.forward(x);
-    torch::Tensor attention_output = this->attention.forward(pre_normed, attention_mask);
+    torch::Tensor attention_output = this->attention.forward(pre_normed, attention_mask, use_cache);
     torch::Tensor with_res_connection = attention_output + x; 
     torch::Tensor post_normed = this->post_attention_norm.forward(with_res_connection);
     torch::Tensor mlp_output = this->mlp.forward(post_normed);
     return with_res_connection + mlp_output;
 }
 
-torch::Tensor Attention::rope_embeddings(const torch::Tensor& x) { 
+void Block::initialize_cache(int64_t batch_size, int64_t capacity) {
+    this->attention.initialize_cache(batch_size, capacity);
+}
+
+void Attention::initialize_cache(int64_t batch_size, int64_t capacity) {
+    this->cache.keys = torch::empty({batch_size, this->num_kv_heads, capacity, this->head_dim}, this->wq.options());
+    this->cache.values = torch::empty({batch_size, this->num_kv_heads, capacity, this->head_dim}, this->wq.options());
+    this->cache.length = 0;
+}
+
+torch::Tensor Attention::rope_embeddings(const torch::Tensor& x, int64_t start_position) { 
     // Pre compute frequencies theta_i
     // torch.arange(0, d_model, 2)
     int64_t head_dim = x.size(-1);
@@ -81,7 +95,7 @@ torch::Tensor Attention::rope_embeddings(const torch::Tensor& x) {
     torch::Tensor dim_pair = torch::arange(0, head_dim, 2, torch::TensorOptions().dtype(torch::kFloat32).device(x.device())); // [0, 2, ...., head_dim - 2]
     float base = this->rope_theta;
     torch::Tensor frequencies = torch::pow(base, -dim_pair / static_cast<double>(head_dim)).unsqueeze(0);
-    torch::Tensor token_position = torch::arange(0, num_tokens, torch::TensorOptions().dtype(torch::kFloat32).device(x.device())).unsqueeze(1);
+    torch::Tensor token_position = torch::arange(start_position, start_position + num_tokens, torch::TensorOptions().dtype(torch::kFloat32).device(x.device())).unsqueeze(1);
     // Compute cos(m * freq), sin(m * freq) 
     torch::Tensor cosine_freq = torch::cos(torch::matmul(token_position, frequencies)).to(x.scalar_type());
     torch::Tensor sine_freq = torch::sin(torch::matmul(token_position, frequencies)).to(x.scalar_type());
@@ -102,20 +116,57 @@ torch::Tensor Attention::rope_embeddings(const torch::Tensor& x) {
 
 torch::Tensor Attention::forward(
     const torch::Tensor& x,
-    const torch::Tensor& attention_mask) { 
+    const torch::Tensor& attention_mask,
+    bool use_cache) { 
     // dimension of x is (B, N, d_model)
     // dimension of wq is (d_model, d_model), bq is (d_model)
     torch::Tensor q = torch::matmul(x, this->wq.transpose(-2, -1)) + this->bq;
-    torch::Tensor k = torch::matmul(x, this->wk.transpose(-2, -1)) + this->bk;
-    torch::Tensor v = torch::matmul(x, this->wv.transpose(-2, -1)) + this->bv;
+    torch::Tensor k_curr = torch::matmul(x, this->wk.transpose(-2, -1)) + this->bk;
+    torch::Tensor v_curr = torch::matmul(x, this->wv.transpose(-2, -1)) + this->bv;
 
+    // TODO: if use_cache = True then load in the k and v matrix fromthe cache and cat k_curr and v_curr
+    int past_length;
+    if (use_cache) past_length = this->cache.length; 
+    else past_length = 0;
+    // TODO: otherwise set k = k_curr, v = v_curr
+    
     // we now want to split q k v into heads 
     q = q.view({q.size(0), q.size(1), this->num_query_heads, this->head_dim}).transpose(1, 2);
-    k = k.view({k.size(0), k.size(1), this->num_kv_heads, this->head_dim}).transpose(1, 2);
-    v = v.view({v.size(0), v.size(1), this->num_kv_heads, this->head_dim}).transpose(1, 2);
+    k_curr = k_curr.view({k_curr.size(0), k_curr.size(1), this->num_kv_heads, this->head_dim}).transpose(1, 2);
+    v_curr = v_curr.view({v_curr.size(0), v_curr.size(1), this->num_kv_heads, this->head_dim}).transpose(1, 2);
+    
 
-    q = rope_embeddings(q);
-    k = rope_embeddings(k); 
+    // TODO: do we still need to embed both q and k? 
+    q = rope_embeddings(q, past_length);
+    k_curr = rope_embeddings(k_curr, past_length);
+    
+    torch::Tensor k; 
+    torch::Tensor v; 
+
+    if(use_cache) {
+        if (!this->cache.keys.defined())
+            throw runtime_error("KV cache was not initialized");
+
+        int64_t current_length = k_curr.size(2); 
+        int64_t end = past_length + current_length;
+
+        if(end > this->cache.keys.size(2)) { 
+            throw runtime_error("kv cache size exceeded");
+        }
+
+        this->cache.keys.slice(2, past_length, end).copy_(k_curr);
+        this->cache.values.slice(2, past_length, end).copy_(v_curr);
+
+        this->cache.length = end; 
+        k = this->cache.keys.slice(2, 0, end); 
+        v = this->cache.values.slice(2, 0, end);
+    } else { 
+        k = k_curr; 
+        v = v_curr;
+    }
+
+    if (attention_mask.size(-1) != k.size(2))
+        throw runtime_error("Attention mask and KV lengths do not match");
 
     int repetitions = this->num_query_heads / this->num_kv_heads; // should be 6
     k = k.repeat_interleave(repetitions, 1);
@@ -164,7 +215,6 @@ torch::Tensor LayerNorm::forward(const torch::Tensor& x) {
     torch::Tensor output = normalized * weights; // (B, N, d_model) 
     return output.to(input_type);
 }
-
 
 ModelConfig Loader::load_config() { 
     std::ifstream file(config_path);
@@ -232,7 +282,6 @@ struct TensorInfo {
     size_t start; 
     size_t end; 
 };
-
 
 unordered_map<string, TensorInfo> read_json_tensors(string header_json) { 
     json header = json::parse(header_json);
