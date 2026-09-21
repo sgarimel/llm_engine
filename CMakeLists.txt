@@ -18,9 +18,22 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(tokenizers_cpp_dependency)
 
 add_library(llmengine model.cpp tokenizer.cpp inference.cpp)
+add_library(
+    llmengine_int8
+    quantized_model.cpp
+    tokenizer.cpp
+    inference.cpp
+)
 
 target_link_libraries(
     llmengine
+    PUBLIC
+    "${TORCH_LIBRARIES}"
+    tokenizers_cpp
+)
+
+target_link_libraries(
+    llmengine_int8
     PUBLIC
     "${TORCH_LIBRARIES}"
     tokenizers_cpp
@@ -32,7 +45,15 @@ target_link_libraries(
     nlohmann_json::nlohmann_json
 )
 
+target_link_libraries(
+    llmengine_int8
+    PRIVATE
+    nlohmann_json::nlohmann_json
+)
+
 add_executable(llmengine_app main.cpp)
+add_executable(llmengine_int8_app main.cpp)
+add_executable(quantize_int8 quantize.cpp)
 
 target_link_libraries(
     llmengine_app
@@ -41,7 +62,28 @@ target_link_libraries(
     "${TORCH_LIBRARIES}"
 )
 
+target_compile_definitions(llmengine_int8_app PRIVATE LLMENGINE_INT8=1)
+target_link_libraries(
+    llmengine_int8_app
+    PRIVATE
+    llmengine_int8
+    "${TORCH_LIBRARIES}"
+)
+
+target_link_libraries(
+    quantize_int8
+    PRIVATE
+    llmengine
+    "${TORCH_LIBRARIES}"
+    nlohmann_json::nlohmann_json
+)
+
 set_property(
     TARGET llmengine
+    PROPERTY CXX_STANDARD 20
+)
+
+set_property(
+    TARGET llmengine_int8
     PROPERTY CXX_STANDARD 20
 )

@@ -245,7 +245,13 @@ int main() {
     string config_path = "models/qwen2.5-1.5b-instruct/config.json";
     string generation_config_path =
         "models/qwen2.5-1.5b-instruct/generation_config.json";
-    string weights_path = "models/qwen2.5-1.5b-instruct/model.safetensors";
+    bool test_quantize = false;
+#ifdef LLMENGINE_INT8
+    test_quantize = true;
+#endif
+    string weights_path = test_quantize
+        ? "models/qwen2.5-1.5b-instruct/model-int8.safetensors"
+        : "models/qwen2.5-1.5b-instruct/model.safetensors";
     string tokenizer_path = "models/qwen2.5-1.5b-instruct/tokenizer.json";
     Loader l(config_path, generation_config_path, weights_path);
     GenerationConfig generation_config = l.load_generation_config();
@@ -293,8 +299,9 @@ int main() {
         store_result(kv_cache_results, kv_cache);
     }
 
-    print_results("No cache", no_cache_results);
-    print_results("KV cache", kv_cache_results);
+    string model_name = test_quantize ? "INT8" : "BF16";
+    print_results(model_name + " no cache", no_cache_results);
+    print_results(model_name + " KV cache", kv_cache_results);
 
     return 0;
 }

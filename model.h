@@ -39,6 +39,11 @@ struct GenerationConfig {
     int top_k;
 };
 
+struct RoPECache { 
+    torch::Tensor cosine;
+    torch::Tensor sine; 
+};
+
 struct LayerKVCache { 
     torch::Tensor keys; 
     torch::Tensor values; 
@@ -82,6 +87,38 @@ class Attention {
             num_kv_heads(num_kv_heads),
             head_dim(head_dim),
             rope_theta(rope_theta) {}
+
+        Attention(
+            torch::Tensor wq,
+            torch::Tensor bq,
+            torch::Tensor wq_scale,
+            torch::Tensor wk,
+            torch::Tensor bk,
+            torch::Tensor wk_scale,
+            torch::Tensor wv,
+            torch::Tensor bv,
+            torch::Tensor wv_scale,
+            torch::Tensor wo,
+            torch::Tensor wo_scale,
+            int num_query_heads,
+            int num_kv_heads,
+            int head_dim,
+            double rope_theta)
+            : wq(wq),
+            bq(bq),
+            wq_scale(wq_scale),
+            wk(wk),
+            bk(bk),
+            wk_scale(wk_scale),
+            wv(wv),
+            bv(bv),
+            wv_scale(wv_scale),
+            wo(wo),
+            wo_scale(wo_scale),
+            num_query_heads(num_query_heads),
+            num_kv_heads(num_kv_heads),
+            head_dim(head_dim),
+            rope_theta(rope_theta) {}
  
         torch::Tensor forward(
             const torch::Tensor& x,
@@ -95,11 +132,15 @@ class Attention {
 
         torch::Tensor wq; 
         torch::Tensor bq; 
+        torch::Tensor wq_scale;
         torch::Tensor wk; 
         torch::Tensor bk;
+        torch::Tensor wk_scale;
         torch::Tensor wv;
         torch::Tensor bv; 
+        torch::Tensor wv_scale;
         torch::Tensor wo; 
+        torch::Tensor wo_scale;
         LayerKVCache cache;
 
         int num_query_heads;
@@ -120,11 +161,30 @@ class MLP {
             down_proj(down),
             hidden_act(hidden_act) {}
 
+        MLP(
+            torch::Tensor gate,
+            torch::Tensor gate_scale,
+            torch::Tensor up,
+            torch::Tensor up_scale,
+            torch::Tensor down,
+            torch::Tensor down_scale,
+            string hidden_act)
+            : gate_proj(gate),
+            gate_proj_scale(gate_scale),
+            up_proj(up),
+            up_proj_scale(up_scale),
+            down_proj(down),
+            down_proj_scale(down_scale),
+            hidden_act(hidden_act) {}
+
         torch::Tensor forward(const torch::Tensor& x);
     private: 
         torch::Tensor gate_proj; 
+        torch::Tensor gate_proj_scale;
         torch::Tensor up_proj;
+        torch::Tensor up_proj_scale;
         torch::Tensor down_proj; 
+        torch::Tensor down_proj_scale;
         string hidden_act;
 };
 

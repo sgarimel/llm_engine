@@ -23,6 +23,17 @@ const unordered_map<string, function<torch::Tensor(const torch::Tensor&)> > acti
     {"tanh", [](const torch::Tensor& x) { return torch::tanh(x); }}
 };
 
+torch::Tensor int8_projection(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& scale) {
+    vector<int64_t> output_shape = x.sizes().vec();
+    torch::Tensor flat_x = x.reshape({-1, x.size(-1)});
+    torch::Tensor output = at::_weight_int8pack_mm(flat_x, weight, scale);
+    output_shape.back() = weight.size(0);
+    return output.reshape(output_shape);
+}
+
 torch::Tensor Model::forward(const torch::Tensor& input_ids, const torch::Tensor& padding_mask, bool use_cache) {
 
 
@@ -82,8 +93,8 @@ void Block::initialize_cache(int64_t batch_size, int64_t capacity) {
 }
 
 void Attention::initialize_cache(int64_t batch_size, int64_t capacity) {
-    this->cache.keys = torch::empty({batch_size, this->num_kv_heads, capacity, this->head_dim}, this->wq.options());
-    this->cache.values = torch::empty({batch_size, this->num_kv_heads, capacity, this->head_dim}, this->wq.options());
+    this->cache.keys = torch::empty({batch_size, this->num_kv_heads, capacity, this->head_dim}, this->bq.options().dtype(torch::kBFloat16));
+    this->cache.values = torch::empty({batch_size, this->num_kv_heads, capacity, this->head_dim}, this->bq.options().dtype(torch::kBFloat16));
     this->cache.length = 0;
 }
 
@@ -121,9 +132,9 @@ torch::Tensor Attention::forward(
     bool use_cache) { 
     // dimension of x is (B, N, d_model)
     // dimension of wq is (d_model, d_model), bq is (d_model)
-    torch::Tensor q = torch::matmul(x, this->wq.transpose(-2, -1)) + this->bq;
-    torch::Tensor k_curr = torch::matmul(x, this->wk.transpose(-2, -1)) + this->bk;
-    torch::Tensor v_curr = torch::matmul(x, this->wv.transpose(-2, -1)) + this->bv;
+    torch::Tensor q = int8_projection(x, this->wq, this->wq_scale) + this->bq;
+    torch::Tensor k_curr = int8_projection(x, this->wk, this->wk_scale) + this->bk;
+    torch::Tensor v_curr = int8_projection(x, this->wv, this->wv_scale) + this->bv;
 
     // TODO: if use_cache = True then load in the k and v matrix fromthe cache and cat k_curr and v_curr
     int past_length;
@@ -188,7 +199,7 @@ torch::Tensor Attention::forward(
     attention = attention.transpose(1, 2).contiguous();
     attention = attention.view({attention.size(0), attention.size(1), this->num_query_heads * this->head_dim}).contiguous();
 
-    torch::Tensor linear_projection = torch::matmul(attention, this->wo.transpose(-2, -1));
+    torch::Tensor linear_projection = int8_projection(attention, this->wo, this->wo_scale);
     return linear_projection;
     
 }
@@ -199,11 +210,11 @@ torch::Tensor MLP::forward(const torch::Tensor& x) {
     // up_proj = (intermediate_size, d_model)
     // down_proj = (d_model, intermediate_size)
     torch::Tensor swished = activation_to_function.at(this->hidden_act)(
-        torch::matmul(x, this->gate_proj.transpose(-2, -1))
+        int8_projection(x, this->gate_proj, this->gate_proj_scale)
     ); // (B, N, intermediate_size)
-    torch::Tensor up = torch::matmul(x, this->up_proj.transpose(-2, -1)); // (B, N, intermediate)
+    torch::Tensor up = int8_projection(x, this->up_proj, this->up_proj_scale); // (B, N, intermediate)
     torch::Tensor hadamard = swished * up; // (B, N, intermediate)
-    return torch::matmul(hadamard, this->down_proj.transpose(-2, -1)); // (B, N, d_model)
+    return int8_projection(hadamard, this->down_proj, this->down_proj_scale); // (B, N, d_model)
     
 }
 
@@ -332,15 +343,22 @@ void validate_tensor_names(
     };
     const vector<string> layer_weights = {
         "self_attn.q_proj.weight",
+        "self_attn.q_proj.weight_scale",
         "self_attn.q_proj.bias",
         "self_attn.k_proj.weight",
+        "self_attn.k_proj.weight_scale",
         "self_attn.k_proj.bias",
         "self_attn.v_proj.weight",
+        "self_attn.v_proj.weight_scale",
         "self_attn.v_proj.bias",
         "self_attn.o_proj.weight",
+        "self_attn.o_proj.weight_scale",
         "mlp.gate_proj.weight",
+        "mlp.gate_proj.weight_scale",
         "mlp.up_proj.weight",
+        "mlp.up_proj.weight_scale",
         "mlp.down_proj.weight",
+        "mlp.down_proj.weight_scale",
         "input_layernorm.weight",
         "post_attention_layernorm.weight"
     };
@@ -419,6 +437,11 @@ Model Loader::load_model() {
             tensors, data_ptr, data_size
         );
 
+        torch::Tensor q_scale = load_tensor(
+            prefix + "self_attn.q_proj.weight_scale",
+            tensors, data_ptr, data_size
+        );
+
         torch::Tensor k_weight = load_tensor(
             prefix + "self_attn.k_proj.weight",
             tensors, data_ptr, data_size
@@ -426,6 +449,11 @@ Model Loader::load_model() {
 
         torch::Tensor k_bias = load_tensor(
             prefix + "self_attn.k_proj.bias",
+            tensors, data_ptr, data_size
+        );
+
+        torch::Tensor k_scale = load_tensor(
+            prefix + "self_attn.k_proj.weight_scale",
             tensors, data_ptr, data_size
         );
 
@@ -439,8 +467,18 @@ Model Loader::load_model() {
             tensors, data_ptr, data_size
         );
 
+        torch::Tensor v_scale = load_tensor(
+            prefix + "self_attn.v_proj.weight_scale",
+            tensors, data_ptr, data_size
+        );
+
         torch::Tensor o_weight = load_tensor(
             prefix + "self_attn.o_proj.weight",
+            tensors, data_ptr, data_size
+        );
+
+        torch::Tensor o_scale = load_tensor(
+            prefix + "self_attn.o_proj.weight_scale",
             tensors, data_ptr, data_size
         );
 
@@ -449,13 +487,28 @@ Model Loader::load_model() {
             tensors, data_ptr, data_size
         );
 
+        torch::Tensor down_scale = load_tensor(
+            prefix + "mlp.down_proj.weight_scale",
+            tensors, data_ptr, data_size
+        );
+
         torch::Tensor gate_proj = load_tensor(
             prefix + "mlp.gate_proj.weight",
             tensors, data_ptr, data_size
         );
 
+        torch::Tensor gate_scale = load_tensor(
+            prefix + "mlp.gate_proj.weight_scale",
+            tensors, data_ptr, data_size
+        );
+
         torch::Tensor up_proj = load_tensor(
             prefix + "mlp.up_proj.weight",
+            tensors, data_ptr, data_size
+        );
+
+        torch::Tensor up_scale = load_tensor(
+            prefix + "mlp.up_proj.weight_scale",
             tensors, data_ptr, data_size
         );
 
@@ -478,11 +531,15 @@ Model Loader::load_model() {
         Attention attention(
             q_weight,
             q_bias,
+            q_scale,
             k_weight,
             k_bias,
+            k_scale,
             v_weight,
             v_bias,
+            v_scale,
             o_weight,
+            o_scale,
             config.num_query_heads,
             config.num_kv_heads,
             config.head_dim,
@@ -491,8 +548,11 @@ Model Loader::load_model() {
 
         MLP mlp(
             gate_proj,
+            gate_scale,
             up_proj,
+            up_scale,
             down_proj,
+            down_scale,
             config.hidden_act
         );
 
